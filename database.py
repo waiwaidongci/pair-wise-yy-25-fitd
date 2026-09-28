@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import math
 import sqlite3
-from collections import Counter, defaultdict
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
 
 
 class DomainError(ValueError):
@@ -15,6 +13,8 @@ class DomainError(ValueError):
 
 class CorpusDB:
     """A small multi-annotator corpus governance service."""
+
+    REQUIRED_ANNOTATIONS = 2
 
     def __init__(self, path: str = "corpus.db") -> None:
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -85,12 +85,13 @@ class CorpusDB:
             );
             CREATE TABLE IF NOT EXISTS adjudications (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
-              item_id INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
+              item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
               guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
               final_label TEXT NOT NULL,
               reason TEXT NOT NULL,
               arbitrator_id INTEGER NOT NULL REFERENCES users(id),
-              created_at TEXT NOT NULL
+              created_at TEXT NOT NULL,
+              UNIQUE(item_id, guideline_id)
             );
             CREATE TABLE IF NOT EXISTS discussions (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,17 +117,88 @@ class CorpusDB:
               frozen_by INTEGER NOT NULL REFERENCES users(id),
               frozen_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS batch_guideline_switches (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+              from_guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+              to_guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+              manager_id INTEGER NOT NULL REFERENCES users(id),
+              switched_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_items_batch ON items(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_assignments_batch ON assignments(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_annotations_item_guideline ON annotations(item_id, guideline_id);
+            CREATE INDEX IF NOT EXISTS idx_adjudications_item_guideline ON adjudications(item_id, guideline_id);
+            CREATE INDEX IF NOT EXISTS idx_guideline_switches_batch ON batch_guideline_switches(batch_id);
             """
         )
+        self._migrate_adjudications()
         self.conn.commit()
+
+    def _adjudication_unique_columns(self) -> tuple[str, ...] | None:
+        for index in self.conn.execute("PRAGMA index_list('adjudications')").fetchall():
+            if index["origin"] != "u":
+                continue
+            index_name = str(index["name"]).replace('"', '""')
+            rows = self.conn.execute(f'PRAGMA index_info("{index_name}")').fetchall()
+            columns = tuple(row["name"] for row in rows)
+            if columns:
+                return columns
+        return None
+
+    def _migrate_adjudications(self) -> None:
+        """Move databases created before item+guideline adjudication uniqueness."""
+        if not self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='adjudications'"
+        ).fetchone():
+            return
+        if self._adjudication_unique_columns() == ("item_id", "guideline_id"):
+            return
+
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self.transaction():
+                self.conn.execute("ALTER TABLE adjudications RENAME TO adjudications_legacy")
+                self.conn.execute(
+                    """
+                    CREATE TABLE adjudications (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                      guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+                      final_label TEXT NOT NULL,
+                      reason TEXT NOT NULL,
+                      arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+                      created_at TEXT NOT NULL,
+                      UNIQUE(item_id, guideline_id)
+                    )
+                    """
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO adjudications(
+                      id,item_id,guideline_id,final_label,reason,arbitrator_id,created_at
+                    )
+                    SELECT id,item_id,guideline_id,final_label,reason,arbitrator_id,created_at
+                    FROM adjudications_legacy
+                    """
+                )
+                self.conn.execute("DROP TABLE adjudications_legacy")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_adjudications_item_guideline "
+                    "ON adjudications(item_id, guideline_id)"
+                )
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
             return
         a1 = self.add_user("标注员甲", "annotator")
         a2 = self.add_user("标注员乙", "annotator")
-        arb = self.add_user("仲裁员", "arbitrator")
+        self.add_user("仲裁员", "arbitrator")
+        self.add_user("管理员", "manager")
         guideline = self.add_guideline("v1", "标签仅可为 正向/负向/中性；先独立标注，不得查看他人答案。")
+        self.add_guideline("v2", "新版规则：标签仅可为 正向/负向/中性；反讽和弱情绪需在备注中说明。")
         batch = self.create_batch("情感标注示例", guideline)
         item1 = self.add_item(batch, 1, "这个更新让工作流畅了很多。")
         item2 = self.add_item(batch, 2, "功能没有变化，但也没有明显问题。")
@@ -209,14 +281,17 @@ class CorpusDB:
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能修改标注")
         with self.transaction():
-            self.conn.execute("DELETE FROM adjudications WHERE item_id=?", (item_id,))
+            self.conn.execute(
+                "DELETE FROM adjudications WHERE item_id=? AND guideline_id=?",
+                (item_id, item["guideline_id"]),
+            )
             try:
                 cur = self.conn.execute(
                     "INSERT INTO annotations(item_id,annotator_id,guideline_id,label,comment,created_at) VALUES(?,?,?,?,?,?)",
                     (item_id, annotator_id, item["guideline_id"], label.strip(), comment.strip(), datetime.now().isoformat()),
                 )
             except sqlite3.IntegrityError:
-                cur = self.conn.execute(
+                self.conn.execute(
                     "UPDATE annotations SET label=?,comment=?,created_at=? WHERE item_id=? AND annotator_id=? AND guideline_id=?",
                     (label.strip(), comment.strip(), datetime.now().isoformat(), item_id, annotator_id, item["guideline_id"]),
                 )
@@ -228,6 +303,92 @@ class CorpusDB:
                 annotation_id = int(cur.lastrowid)
             self.conn.execute("UPDATE assignments SET status='submitted' WHERE id=?", (assignment["id"],))
         return int(annotation_id)
+
+    def switch_batch_guideline(self, batch_id: int, guideline_id: int, manager_id: int) -> dict:
+        manager = self.conn.execute("SELECT role FROM users WHERE id=?", (manager_id,)).fetchone()
+        batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        target = self.conn.execute(
+            "SELECT * FROM guidelines WHERE id=? AND active=1", (guideline_id,)
+        ).fetchone()
+        if not batch or not manager or manager["role"] != "manager":
+            raise DomainError("批次或管理员无效")
+        if not target:
+            raise DomainError("新版指南不存在或未启用")
+        if batch["status"] == "frozen":
+            raise DomainError("冻结后不能换版")
+        if batch["guideline_id"] == guideline_id:
+            raise DomainError("批次已经绑定该指南版本")
+
+        switched_at = datetime.now().isoformat()
+        with self.transaction():
+            cur = self.conn.execute(
+                """
+                INSERT INTO batch_guideline_switches(
+                  batch_id,from_guideline_id,to_guideline_id,manager_id,switched_at
+                ) VALUES(?,?,?,?,?)
+                """,
+                (batch_id, batch["guideline_id"], guideline_id, manager_id, switched_at),
+            )
+            event_id = int(cur.lastrowid)
+            self.conn.execute("UPDATE batches SET guideline_id=? WHERE id=?", (guideline_id, batch_id))
+            self.conn.execute(
+                """
+                UPDATE assignments
+                SET status = CASE
+                  WHEN EXISTS (
+                    SELECT 1 FROM annotations a
+                    WHERE a.item_id=assignments.item_id
+                      AND a.annotator_id=assignments.annotator_id
+                      AND a.guideline_id=?
+                  ) THEN 'submitted'
+                  ELSE 'assigned'
+                END
+                WHERE batch_id=?
+                """,
+                (guideline_id, batch_id),
+            )
+        return self.guideline_switch(event_id)
+
+    def guideline_switch(self, event_id: int) -> dict:
+        row = self.conn.execute(
+            """
+            SELECT s.id,s.batch_id,s.from_guideline_id,s.to_guideline_id,s.manager_id,
+                   u.name AS manager_name,s.switched_at,
+                   gf.version AS from_version,gt.version AS to_version,
+                   gt.rules AS to_rules
+            FROM batch_guideline_switches s
+            JOIN users u ON u.id=s.manager_id
+            JOIN guidelines gf ON gf.id=s.from_guideline_id
+            JOIN guidelines gt ON gt.id=s.to_guideline_id
+            WHERE s.id=?
+            """,
+            (event_id,),
+        ).fetchone()
+        if not row:
+            raise DomainError("换版记录不存在")
+        return dict(row)
+
+    def guideline_switches(self, batch_id: int) -> list[dict]:
+        if not self.conn.execute("SELECT 1 FROM batches WHERE id=?", (batch_id,)).fetchone():
+            raise DomainError("批次不存在")
+        return [
+            dict(row)
+            for row in self.conn.execute(
+                """
+                SELECT s.id,s.batch_id,s.from_guideline_id,s.to_guideline_id,s.manager_id,
+                       u.name AS manager_name,s.switched_at,
+                       gf.version AS from_version,gt.version AS to_version,
+                       gt.rules AS to_rules
+                FROM batch_guideline_switches s
+                JOIN users u ON u.id=s.manager_id
+                JOIN guidelines gf ON gf.id=s.from_guideline_id
+                JOIN guidelines gt ON gt.id=s.to_guideline_id
+                WHERE s.batch_id=?
+                ORDER BY s.id
+                """,
+                (batch_id,),
+            ).fetchall()
+        ]
 
     def add_discussion(self, item_id: int, author_id: int, body: str, contains_answer: bool = False) -> int:
         if not body.strip():
@@ -245,26 +406,51 @@ class CorpusDB:
 
     def get_item_for_user(self, item_id: int, user_id: int) -> dict:
         item = self.conn.execute(
-            "SELECT i.id,i.batch_id,i.ordinal,i.text,g.version AS guideline_version,g.rules "
-            "FROM items i JOIN batches b ON b.id=i.batch_id JOIN guidelines g ON g.id=b.guideline_id WHERE i.id=?",
+            """
+            SELECT i.id,i.batch_id,i.ordinal,i.text,g.id AS guideline_id,
+                   g.version AS guideline_version,g.rules
+            FROM items i
+            JOIN batches b ON b.id=i.batch_id
+            JOIN guidelines g ON g.id=b.guideline_id
+            WHERE i.id=?
+            """,
             (item_id,),
         ).fetchone()
         if not item:
             raise DomainError("条目不存在")
         own = self.conn.execute(
-            "SELECT id,label,comment,created_at FROM annotations WHERE item_id=? AND annotator_id=?", (item_id, user_id)
+            """
+            SELECT a.id,a.guideline_id,g.version AS guideline_version,a.label,a.comment,a.created_at
+            FROM annotations a JOIN guidelines g ON g.id=a.guideline_id
+            WHERE a.item_id=? AND a.annotator_id=? AND a.guideline_id=?
+            ORDER BY a.id
+            """,
+            (item_id, user_id, item["guideline_id"]),
         ).fetchone()
+        own_annotations = [
+            dict(row)
+            for row in self.conn.execute(
+                """
+                SELECT a.id,a.guideline_id,g.version AS guideline_version,a.label,a.comment,a.created_at
+                FROM annotations a JOIN guidelines g ON g.id=a.guideline_id
+                WHERE a.item_id=? AND a.annotator_id=?
+                ORDER BY a.guideline_id,a.id
+                """,
+                (item_id, user_id),
+            ).fetchall()
+        ]
         revealed = own is not None
         discussions = []
         for row in self.conn.execute(
             "SELECT d.*,u.name FROM discussions d JOIN users u ON u.id=d.author_id WHERE d.item_id=? ORDER BY d.id", (item_id,)
         ).fetchall():
             if row["contains_answer"] and not revealed:
-                discussions.append({"id": row["id"], "author": row["name"], "body": "提交自己的标注后才能查看此讨论", "hidden": True})
+                discussions.append({"id": row["id"], "author": row["name"], "body": "提交自己的当前版本标注后才能查看此讨论", "hidden": True})
             else:
                 discussions.append(dict(row))
         payload = dict(item)
         payload["own_annotation"] = dict(own) if own else None
+        payload["own_annotations"] = own_annotations
         payload["discussions"] = discussions
         return payload
 
@@ -275,12 +461,21 @@ class CorpusDB:
         result = []
         for item in self.conn.execute("SELECT * FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall():
             rows = self.conn.execute(
-                "SELECT a.*,u.name FROM annotations a JOIN users u ON u.id=a.annotator_id "
-                "WHERE a.item_id=? AND a.guideline_id=? ORDER BY a.id",
+                """
+                SELECT a.*,u.name,g.version AS guideline_version
+                FROM annotations a
+                JOIN users u ON u.id=a.annotator_id
+                JOIN guidelines g ON g.id=a.guideline_id
+                WHERE a.item_id=? AND a.guideline_id=?
+                ORDER BY a.id
+                """,
                 (item["id"], batch["guideline_id"]),
             ).fetchall()
             labels = {row["label"] for row in rows}
-            adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
+            adj = self.conn.execute(
+                "SELECT * FROM adjudications WHERE item_id=? AND guideline_id=?",
+                (item["id"], batch["guideline_id"]),
+            ).fetchone()
             if len(rows) >= 2 and len(labels) > 1 and not adj:
                 result.append({
                     "item_id": item["id"], "ordinal": item["ordinal"], "text": item["text"],
@@ -297,9 +492,12 @@ class CorpusDB:
             raise DomainError("条目或仲裁员无效")
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能重新仲裁")
-        rows = self.conn.execute("SELECT label FROM annotations WHERE item_id=?", (item_id,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?",
+            (item_id, item["guideline_id"]),
+        ).fetchall()
         if len(rows) < 2:
-            raise DomainError("至少需要两份标注才能仲裁")
+            raise DomainError("当前指南至少需要两份标注才能仲裁")
         if not final_label.strip() or len(reason.strip()) < 5:
             raise DomainError("最终标签必填，仲裁理由至少5个字符")
         with self.transaction():
@@ -309,17 +507,27 @@ class CorpusDB:
                     (item_id, item["guideline_id"], final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat()),
                 )
             except sqlite3.IntegrityError:
-                cur = self.conn.execute(
-                    "UPDATE adjudications SET final_label=?,reason=?,arbitrator_id=?,created_at=? WHERE item_id=?",
-                    (final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat(), item_id),
+                self.conn.execute(
+                    "UPDATE adjudications SET final_label=?,reason=?,arbitrator_id=?,created_at=? WHERE item_id=? AND guideline_id=?",
+                    (final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat(), item_id, item["guideline_id"]),
                 )
-                adjudication_id = self.conn.execute("SELECT id FROM adjudications WHERE item_id=?", (item_id,)).fetchone()["id"]
+                adjudication_id = self.conn.execute(
+                    "SELECT id FROM adjudications WHERE item_id=? AND guideline_id=?",
+                    (item_id, item["guideline_id"]),
+                ).fetchone()["id"]
             else:
                 adjudication_id = int(cur.lastrowid)
         return int(adjudication_id)
 
     def consistency(self, batch_id: int) -> dict:
-        batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        batch = self.conn.execute(
+            """
+            SELECT b.*,g.version AS guideline_version
+            FROM batches b JOIN guidelines g ON g.id=b.guideline_id
+            WHERE b.id=?
+            """,
+            (batch_id,),
+        ).fetchone()
         if not batch:
             raise DomainError("批次不存在")
         items = self.conn.execute("SELECT id,ordinal FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall()
@@ -351,10 +559,67 @@ class CorpusDB:
             kappa = (pairwise - expected) / (1 - expected)
         return {
             "batch_id": batch_id,
+            "guideline_id": batch["guideline_id"],
+            "guideline_version": batch["guideline_version"],
             "items_with_multiple_annotations": total_pairs and sum(1 for row in per_item if row["agreement"] is not None),
             "pairwise_agreement": round(pairwise, 4) if pairwise is not None else None,
             "fleiss_kappa": round(kappa, 4) if kappa is not None else None,
             "items": per_item,
+        }
+
+    def freeze_status(self, batch_id: int) -> dict:
+        batch = self.conn.execute(
+            """
+            SELECT b.*,g.version AS guideline_version,g.rules AS guideline_rules
+            FROM batches b JOIN guidelines g ON g.id=b.guideline_id
+            WHERE b.id=?
+            """,
+            (batch_id,),
+        ).fetchone()
+        if not batch:
+            raise DomainError("批次不存在")
+
+        missing = []
+        items = self.conn.execute("SELECT * FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall()
+        for item in items:
+            assigned_rows = self.conn.execute(
+                "SELECT annotator_id FROM assignments WHERE item_id=? ORDER BY annotator_id", (item["id"],)
+            ).fetchall()
+            assigned_annotators = [row["annotator_id"] for row in assigned_rows]
+            current_rows = self.conn.execute(
+                "SELECT annotator_id FROM annotations WHERE item_id=? AND guideline_id=?",
+                (item["id"], batch["guideline_id"]),
+            ).fetchall()
+            current_annotators = [row["annotator_id"] for row in current_rows]
+            current_set = set(current_annotators)
+            missing_annotators = [user_id for user_id in assigned_annotators if user_id not in current_set]
+            required = max(self.REQUIRED_ANNOTATIONS, len(assigned_annotators))
+            if len(current_rows) < self.REQUIRED_ANNOTATIONS or missing_annotators:
+                missing.append({
+                    "item_id": item["id"],
+                    "ordinal": item["ordinal"],
+                    "text": item["text"],
+                    "current_annotations": len(current_rows),
+                    "required_annotations": required,
+                    "current_annotator_ids": current_annotators,
+                    "missing_annotator_ids": missing_annotators,
+                })
+
+        unresolved = self.disagreements(batch_id)
+        return {
+            "batch_id": batch_id,
+            "status": batch["status"],
+            "current_guideline": {
+                "id": batch["guideline_id"],
+                "version": batch["guideline_version"],
+                "rules": batch["guideline_rules"],
+            },
+            "can_switch": batch["status"] != "frozen",
+            "can_freeze": batch["status"] != "frozen" and bool(items) and not missing and not unresolved,
+            "ready_to_freeze": batch["status"] != "frozen" and bool(items) and not missing and not unresolved,
+            "missing_item_ids": [row["item_id"] for row in missing],
+            "missing_annotations": missing,
+            "unresolved_disagreements": unresolved,
         }
 
     def freeze_batch(self, batch_id: int, manager_id: int) -> dict:
@@ -367,18 +632,11 @@ class CorpusDB:
         items = self.conn.execute("SELECT id FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall()
         if not items:
             raise DomainError("空批次不能冻结")
-        disagreements = self.disagreements(batch_id)
-        if disagreements:
-            raise DomainError(f"仍有 {len(disagreements)} 条分歧未仲裁")
-        missing = []
-        for item in items:
-            count = self.conn.execute(
-                "SELECT COUNT(*) FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
-            ).fetchone()[0]
-            if count < 2:
-                missing.append(item["id"])
-        if missing:
-            raise DomainError(f"条目缺少至少两份标注: {missing}")
+        status = self.freeze_status(batch_id)
+        if status["unresolved_disagreements"]:
+            raise DomainError(f"仍有 {len(status['unresolved_disagreements'])} 条当前版本分歧未仲裁")
+        if status["missing_annotations"]:
+            raise DomainError(f"当前指南标注未收齐，缺少条目: {status['missing_item_ids']}")
         metrics = self.consistency(batch_id)
         frozen_at = datetime.now().isoformat()
         with self.transaction():
@@ -386,7 +644,10 @@ class CorpusDB:
                 labels = [r["label"] for r in self.conn.execute(
                     "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
                 ).fetchall()]
-                adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
+                adj = self.conn.execute(
+                    "SELECT * FROM adjudications WHERE item_id=? AND guideline_id=?",
+                    (item["id"], batch["guideline_id"]),
+                ).fetchone()
                 if adj:
                     label, source, adj_id = adj["final_label"], "adjudication", adj["id"]
                 else:
@@ -400,26 +661,107 @@ class CorpusDB:
                 (batch_id, json.dumps(metrics, ensure_ascii=False), manager_id, frozen_at),
             )
             self.conn.execute("UPDATE batches SET status='frozen' WHERE id=?", (batch_id,))
-        return {"batch_id": batch_id, "metrics": metrics, "frozen_at": frozen_at}
+        return {
+            "batch_id": batch_id,
+            "guideline_id": batch["guideline_id"],
+            "metrics": metrics,
+            "frozen_at": frozen_at,
+        }
 
     def export_gold(self, batch_id: int) -> dict:
-        batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        batch = self.conn.execute(
+            """
+            SELECT b.*,g.version AS guideline_version
+            FROM batches b JOIN guidelines g ON g.id=b.guideline_id
+            WHERE b.id=?
+            """,
+            (batch_id,),
+        ).fetchone()
         if not batch or batch["status"] != "frozen":
             raise DomainError("只有已冻结批次可以导出金标准")
         freeze = self.conn.execute("SELECT * FROM batch_freezes WHERE batch_id=?", (batch_id,)).fetchone()
         rows = self.conn.execute(
-            "SELECT g.item_id,i.ordinal,i.text,g.label,g.source,g.frozen_at FROM gold_records g JOIN items i ON i.id=g.item_id "
-            "WHERE g.batch_id=? ORDER BY i.ordinal", (batch_id,)
+            """
+            SELECT g.item_id,i.ordinal,i.text,g.guideline_id,gg.version AS guideline_version,
+                   g.label,g.source,g.frozen_at
+            FROM gold_records g
+            JOIN items i ON i.id=g.item_id
+            JOIN guidelines gg ON gg.id=g.guideline_id
+            WHERE g.batch_id=?
+            ORDER BY i.ordinal
+            """,
+            (batch_id,),
         ).fetchall()
         return {
-            "batch_id": batch_id, "batch_name": batch["name"], "frozen_at": freeze["frozen_at"],
-            "metrics": json.loads(freeze["metrics_json"]), "records": [dict(row) for row in rows],
+            "batch_id": batch_id,
+            "batch_name": batch["name"],
+            "guideline_id": batch["guideline_id"],
+            "guideline_version": batch["guideline_version"],
+            "frozen_at": freeze["frozen_at"],
+            "metrics": json.loads(freeze["metrics_json"]),
+            "records": [dict(row) for row in rows],
         }
 
     def snapshot(self) -> dict:
+        annotations = [
+            dict(row)
+            for row in self.conn.execute(
+                """
+                SELECT a.*,u.name AS annotator_name,g.version AS guideline_version
+                FROM annotations a
+                JOIN users u ON u.id=a.annotator_id
+                JOIN guidelines g ON g.id=a.guideline_id
+                ORDER BY a.id
+                """
+            ).fetchall()
+        ]
+        adjudications = [
+            dict(row)
+            for row in self.conn.execute(
+                """
+                SELECT ad.*,u.name AS arbitrator_name,g.version AS guideline_version
+                FROM adjudications ad
+                JOIN users u ON u.id=ad.arbitrator_id
+                JOIN guidelines g ON g.id=ad.guideline_id
+                ORDER BY ad.id
+                """
+            ).fetchall()
+        ]
+        freezes = []
+        for row in self.conn.execute("SELECT * FROM batch_freezes ORDER BY batch_id").fetchall():
+            item = dict(row)
+            item["metrics"] = json.loads(item.pop("metrics_json"))
+            freezes.append(item)
         return {
             "users": [dict(r) for r in self.conn.execute("SELECT id,name,role FROM users ORDER BY id")],
             "guidelines": [dict(r) for r in self.conn.execute("SELECT * FROM guidelines ORDER BY id")],
             "batches": [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")],
             "items": [dict(r) for r in self.conn.execute("SELECT * FROM items ORDER BY batch_id,ordinal")],
+            "assignments": [dict(r) for r in self.conn.execute("SELECT * FROM assignments ORDER BY id")],
+            "annotations": annotations,
+            "adjudications": adjudications,
+            "guideline_switches": [
+                dict(row)
+                for row in self.conn.execute(
+                    """
+                    SELECT s.*,gf.version AS from_version,gt.version AS to_version,u.name AS manager_name
+                    FROM batch_guideline_switches s
+                    JOIN guidelines gf ON gf.id=s.from_guideline_id
+                    JOIN guidelines gt ON gt.id=s.to_guideline_id
+                    JOIN users u ON u.id=s.manager_id
+                    ORDER BY s.id
+                    """
+                ).fetchall()
+            ],
+            "freezes": freezes,
+            "gold_records": [
+                dict(row)
+                for row in self.conn.execute(
+                    """
+                    SELECT gr.*,g.version AS guideline_version
+                    FROM gold_records gr JOIN guidelines g ON g.id=gr.guideline_id
+                    ORDER BY gr.id
+                    """
+                ).fetchall()
+            ],
         }

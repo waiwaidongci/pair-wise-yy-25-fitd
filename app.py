@@ -53,6 +53,12 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 3 and parts[:2] == ["api", "items"]:
                 user_id = int(parse_qs(parsed.query).get("user_id", [0])[0])
                 return self._json(200, self.db.get_item_for_user(int(parts[2]), user_id))
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "freeze-status":
+                return self._json(200, self.db.freeze_status(int(parts[2])))
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "guideline-switch":
+                return self._json(200, {"switches": self.db.guideline_switches(int(parts[2]))})
+            if len(parts) == 3 and parts[:2] == ["api", "guideline-switches"]:
+                return self._json(200, self.db.guideline_switch(int(parts[2])))
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "disagreements":
                 return self._json(200, {"disagreements": self.db.disagreements(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "consistency":
@@ -77,6 +83,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": self.db.add_item(int(parts[2]), int(body.get("ordinal", 0)), str(body.get("text", "")))})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "assign":
                 return self._json(201, {"ok": True, "id": self.db.assign(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)))})
+            if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "guideline":
+                result = self.db.switch_batch_guideline(
+                    int(parts[2]),
+                    int(body.get("guideline_id", 0)),
+                    int(body.get("manager_id", 0)),
+                )
+                return self._json(200, {"ok": True, "switch": result, "id": result["id"]})
             if path == "/api/annotations":
                 return self._json(201, {"ok": True, "id": self.db.submit_annotation(int(body.get("item_id", 0)), int(body.get("annotator_id", 0)), str(body.get("label", "")), str(body.get("comment", "")))})
             if path == "/api/adjudications":

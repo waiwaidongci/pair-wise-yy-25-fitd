@@ -1,8 +1,160 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>语料标注与仲裁</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:24px auto;padding:0 16px;background:#f6f7f9}section{background:#fff;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}input,textarea,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}button{background:#235347;color:#fff}pre{white-space:pre-wrap;max-height:360px;overflow:auto}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input,.grid textarea{width:90%}</style>
-<h1>语料标注与争议仲裁</h1><section><button onclick="load()">刷新状态</button><pre id="state"></pre></section>
-<section><h2>标注与讨论</h2><div class="grid"><input id="item" type="number" placeholder="条目 ID"><input id="user" type="number" placeholder="用户 ID"><input id="label" placeholder="标签"><textarea id="comment" placeholder="备注"></textarea><input id="batch" type="number" placeholder="批次 ID"><input id="manager" type="number" placeholder="管理员 ID"></div>
-<button onclick="annotate()">提交标注</button><button onclick="loadItem()">查看条目与讨论可见性</button><button onclick="disagreements()">查看分歧</button><button onclick="consistency()">一致性</button><button onclick="freeze()">冻结金标准</button><pre id="result"></pre></section>
-<section><h2>仲裁</h2><input id="arb" type="number" placeholder="仲裁员 ID"><input id="final" placeholder="最终标签"><input id="reason" placeholder="理由至少5字"><button onclick="adjudicate()">提交仲裁</button></section>
-<script>const result=document.querySelector('#result');const show=x=>result.textContent=JSON.stringify(x,null,2);async function get(u){return show(await(await fetch(u)).json())}async function post(u,b){return show(await(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json())}async function load(){show(await(await fetch('/api/state')).json())}function annotate(){post('/api/annotations',{item_id:+item.value,annotator_id:+user.value,label:label.value,comment:comment.value})}function loadItem(){get('/api/items/'+item.value+'?user_id='+user.value)}function disagreements(){get('/api/batches/'+batch.value+'/disagreements')}function consistency(){get('/api/batches/'+batch.value+'/consistency')}function adjudicate(){post('/api/adjudications',{item_id:+item.value,arbitrator_id:+arb.value,final_label:final.value,reason:reason.value})}function freeze(){post('/api/batches/'+batch.value+'/freeze',{manager_id:+manager.value})}load()</script>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>语料标注与仲裁</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:24px auto;padding:0 16px;background:#f6f7f9;color:#17211d}
+section{background:#fff;padding:16px;margin:12px 0;border:1px solid #ddd;border-radius:10px}
+input,textarea,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}
+button{background:#235347;color:#fff;cursor:pointer}
+button.secondary{background:#516861}
+pre{white-space:pre-wrap;max-height:360px;overflow:auto;background:#f2f4f2;padding:10px;border-radius:8px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.grid input,.grid textarea,.grid select{width:calc(100% - 18px)}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#eef3f1}.muted{color:#66726d;font-size:13px}.tag{display:inline-block;padding:2px 7px;border-radius:999px;background:#e3eeea;color:#235347}
+.warning{background:#fff5e6;border-color:#e5b36d}.danger{color:#9a3412}
+h2{margin-top:4px}
+</style>
+<h1>语料标注与争议仲裁</h1>
+
+<section>
+  <button onclick="load()">刷新状态</button>
+  <span class="muted">批次和标注记录会同时显示当前/历史指南版本。</span>
+  <div id="overview"></div>
+</section>
+
+<section>
+  <h2>管理员换版</h2>
+  <div class="grid">
+    <input id="batch" type="number" placeholder="批次 ID">
+    <input id="manager" type="number" placeholder="管理员 ID">
+    <select id="guidelineSelect"></select>
+    <input id="targetGuideline" type="number" placeholder="或直接填新版指南 ID">
+  </div>
+  <button onclick="switchGuideline()">切换未冻结批次到新版</button>
+  <button class="secondary" onclick="freezeStatus()">查看冻结入口缺项</button>
+  <div id="freezePanel" class="muted">输入批次后可查看当前指南、缺项和未仲裁分歧。</div>
+  <p class="muted">旧版标注按原指南保留；同一条目、同一标注员可再按当前新版提交一份。冻结后不能换版。</p>
+</section>
+
+<section>
+  <h2>标注与讨论</h2>
+  <div class="grid">
+    <input id="item" type="number" placeholder="条目 ID">
+    <input id="user" type="number" placeholder="标注员 ID">
+    <input id="label" placeholder="当前版本标签">
+    <textarea id="comment" placeholder="备注"></textarea>
+  </div>
+  <button onclick="annotate()">提交/更新当前版本标注</button>
+  <button class="secondary" onclick="loadItem()">查看条目、当前指南与本人各版本标注</button>
+  <button class="secondary" onclick="disagreements()">查看当前版本分歧</button>
+  <button class="secondary" onclick="consistency()">当前版本一致性</button>
+  <button onclick="freeze()">冻结金标准</button>
+  <pre id="result"></pre>
+</section>
+
+<section>
+  <h2>仲裁</h2>
+  <input id="arb" type="number" placeholder="仲裁员 ID">
+  <input id="final" placeholder="最终标签">
+  <input id="reason" placeholder="理由至少5字">
+  <button onclick="adjudicate()">提交当前版本仲裁</button>
+</section>
+
+<script>
+const result = document.querySelector('#result');
+const overview = document.querySelector('#overview');
+const freezePanel = document.querySelector('#freezePanel');
+const esc = value => String(value ?? '').replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+const show = x => result.textContent = JSON.stringify(x, null, 2);
+async function request(url, options) {
+  const response = await fetch(url, options);
+  const payload = await response.json();
+  show(payload);
+  return payload;
+}
+async function get(url) { return request(url); }
+async function post(url, body) {
+  return request(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+}
+function selectedGuidelineId() {
+  return Number(targetGuideline.value || guidelineSelect.value || 0);
+}
+function guidelineMap(state) {
+  return Object.fromEntries(state.guidelines.map(g => [g.id, g]));
+}
+function renderOverview(state) {
+  const gmap = guidelineMap(state);
+  guidelineSelect.innerHTML = state.guidelines
+    .filter(g => g.active)
+    .map(g => `<option value="${g.id}">${esc(g.version)}：${esc(g.rules.slice(0, 40))}</option>`)
+    .join('');
+
+  const batchRows = state.batches.map(b => {
+    const g = gmap[b.guideline_id];
+    return `<tr><td>${b.id}</td><td>${esc(b.name)}</td><td><span class="tag">${esc(g ? g.version : b.guideline_id)}</span></td><td>${esc(b.status)}</td><td>${esc(g ? g.rules : '')}</td></tr>`;
+  }).join('');
+
+  const annotationRows = state.annotations.map(a => `<tr>
+    <td>${a.id}</td><td>${a.item_id}</td><td>${esc(a.annotator_name)}</td>
+    <td><span class="tag">${esc(a.guideline_version)}</span></td><td>${esc(a.label)}</td>
+    <td>${esc(a.comment)}</td><td>${esc(a.created_at)}</td>
+  </tr>`).join('');
+
+  const switchRows = state.guideline_switches.map(s => `<tr>
+    <td>${s.id}</td><td>${s.batch_id}</td><td>${esc(s.from_version)} → ${esc(s.to_version)}</td>
+    <td>${esc(s.manager_name)}</td><td>${esc(s.switched_at)}</td>
+  </tr>`).join('') || '<tr><td colspan="5" class="muted">暂无换版记录</td></tr>';
+
+  overview.innerHTML = `
+    <h2>批次当前指南</h2><table><thead><tr><th>ID</th><th>批次</th><th>当前指南</th><th>状态</th><th>规则</th></tr></thead><tbody>${batchRows}</tbody></table>
+    <h2>每条标注记录的指南版本</h2><table><thead><tr><th>ID</th><th>条目</th><th>标注员</th><th>指南版本</th><th>标签</th><th>备注</th><th>时间</th></tr></thead><tbody>${annotationRows}</tbody></table>
+    <h2>换版记录</h2><table><thead><tr><th>ID</th><th>批次</th><th>版本</th><th>管理员</th><th>时间</th></tr></thead><tbody>${switchRows}</tbody></table>`;
+}
+async function load() {
+  const state = await get('/api/state');
+  if (state && state.batches) renderOverview(state);
+}
+function annotate() {
+  post('/api/annotations', {item_id:+item.value, annotator_id:+user.value, label:label.value, comment:comment.value}).then(load);
+}
+function loadItem() { get('/api/items/'+item.value+'?user_id='+user.value); }
+function disagreements() { get('/api/batches/'+batch.value+'/disagreements'); }
+function consistency() { get('/api/batches/'+batch.value+'/consistency'); }
+function adjudicate() {
+  post('/api/adjudications', {item_id:+item.value, arbitrator_id:+arb.value, final_label:final.value, reason:reason.value}).then(load);
+}
+function freeze() {
+  post('/api/batches/'+batch.value+'/freeze', {manager_id:+manager.value}).then(load);
+}
+function renderFreezeStatus(status) {
+  if (!status || !status.current_guideline) return;
+  const missing = status.missing_annotations.map(row =>
+    `<li>条目 #${row.item_id}（序号 ${row.ordinal}）：当前 ${row.current_annotations}/${row.required_annotations} 份，缺标注员 ${esc(row.missing_annotator_ids.join(', ') || '无')}；${esc(row.text)}</li>`
+  ).join('');
+  const disputes = status.unresolved_disagreements.map(row =>
+    `<li>条目 #${row.item_id}（序号 ${row.ordinal}）存在当前版本分歧</li>`
+  ).join('');
+  freezePanel.className = status.ready_to_freeze ? 'tag' : 'danger';
+  freezePanel.innerHTML = `<strong>当前指南：${esc(status.current_guideline.version)}</strong>
+    <ul>${missing || '<li>不缺当前版本标注</li>'}${disputes || '<li>无未仲裁当前版本分歧</li>'}</ul>
+    <div>${status.ready_to_freeze ? '可以冻结。' : '暂时不能冻结。'}</div>`;
+}
+function freezeStatus() {
+  get('/api/batches/'+batch.value+'/freeze-status').then(renderFreezeStatus);
+}
+function switchGuideline() {
+  post('/api/batches/'+batch.value+'/guideline', {
+    guideline_id: selectedGuidelineId(),
+    manager_id:+manager.value
+  }).then(load);
+}
+load();
+</script>
 </html>
